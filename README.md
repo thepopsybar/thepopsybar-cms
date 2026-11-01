@@ -1,6 +1,6 @@
 # The Popsy Bar
 
-Next.js 16 (App Router) · TypeScript · Tailwind 4 · Supabase (content + auth + CRM) · Cloudinary (images) · FormSubmit (inquiry email) · OneSignal (push)
+Next.js 16 (App Router) · TypeScript · Tailwind 4 · Supabase (content + auth + CRM) · Cloudinary (images) · FormSubmit (inquiry email) · Web Push (VAPID, no third-party service)
 
 ## 1. Install and run
 
@@ -122,7 +122,7 @@ Production: `https://thepopsybar.com/admin/dashboard`. A spreadsheet-style list 
 public form -> POST /api/inquiries (server)
    1. validate (+ no past event date)
    2. save to Supabase crm_inquiries   (source forced to "website" on the server)
-   3. OneSignal push (once, only if step 2 inserted a NEW row)
+   3. Web Push to admin devices (once per device, only if step 2 inserted a NEW row; runs alongside the email)
    4. FormSubmit email (unchanged)
 admin "Add Manually" -> server action -> insert with source "manual" (no push; toast only)
 ```
@@ -144,30 +144,73 @@ admin "Add Manually" -> server action -> insert with source "manual" (no push; t
 4. Optional: set `NEXT_PUBLIC_SITE_URL`, `NEXT_PUBLIC_BUSINESS_TIME_ZONE` (see `.env.example`).
 5. Sign in at `/admin/login`; you land on the CRM when you came from `/admin/dashboard`, otherwise open **Customer CRM** in the sidebar.
 
-### OneSignal push notifications (phone)
+### Web Push notifications (custom, no notification service)
 
-1. At onesignal.com create an app, platform **Web**. Choose "Custom Code", site name **The Popsy Bar**, site URL `https://thepopsybar.com`. Leave "Auto Resubscribe" on; the service worker path is `OneSignalSDKWorker.js` (already in `public/`).
-2. Copy the **App ID** -> `NEXT_PUBLIC_ONESIGNAL_APP_ID`. Copy the app's **REST API Key** (Settings -> Keys & IDs) -> `ONESIGNAL_REST_API_KEY` (server-only). Add both in Vercel and redeploy.
-3. Pushes go to the segment `Subscribed Users` (OneSignal's default). If your dashboard names it differently, set `ONESIGNAL_SEGMENT`. The SDK is loaded **only** on the admin CRM page, so only people who open the CRM can subscribe.
-4. **Subscribe your phone** (must be HTTPS, which production is):
-   - **Android (Chrome):** open `https://thepopsybar.com/admin/dashboard`, sign in, tap **Turn on alerts on this device**, then Allow.
-   - **iPhone/iPad (iOS/iPadOS 16.4+):** web push only works from an installed web app. In Safari open the CRM URL, Share -> **Add to Home Screen**, open it **from the home-screen icon**, sign in, tap **Turn on alerts on this device**, Allow.
-5. Tap a notification to open the CRM at `https://thepopsybar.com/admin/dashboard`.
-6. Test: submit a real inquiry on the live site. Check OneSignal -> Delivery -> Messages if nothing arrives (most common causes: phone not subscribed, wrong segment name, wrong REST key).
+#### What was removed
+OneSignal is gone completely: the SDK loader, `OneSignalDeferred`/login code, `public/OneSignalSDKWorker.js`, `src/lib/crm/onesignal.ts` and its tests, and the `NEXT_PUBLIC_ONESIGNAL_APP_ID`, `ONESIGNAL_REST_API_KEY` and `ONESIGNAL_SEGMENT` variables. **Delete those three variables from `.env.local` and from Vercel**, and you may delete the app in the OneSignal dashboard. Old phone subscriptions made through OneSignal stop working; subscribe again with the steps below.
 
-Push has **not** been tested end to end by the developer (no OneSignal credentials or device available); follow step 6 to confirm it on your own setup. Manual CRM entries never send a push.
+#### How it works
+```
+phone/browser --(click "Turn on notifications")--> service worker + PushManager (VAPID public key)
+      --> server action registerPushDevice --> DB function register_admin_push_subscription()  (owner = caller's own session)
+new website inquiry saved --> /api/inquiries --> outbox row per (inquiry, device)  [admin_push_outbox]
+      --> web-push library (VAPID private key, server only) --> browser vendor push service --> your phone
+      --> public/popsy-push-sw.js shows "New Event Inquiry — The Popsy Bar" (no customer details)
+failed/temporary errors stay in the outbox --> /api/push/retry (Vercel Cron or manual) retries with backoff
+open dashboard --> Supabase Realtime shows an in-page toast for new website inquiries (separate from push)
+```
+- **Why the Next.js server (not a Supabase Edge Function):** the inquiry is already created inside `/api/inquiries` on Vercel, the `web-push` library needs Node's crypto/https (an Edge Function runs Deno, where its compatibility isn't guaranteed), and one codebase means one deployment and no extra network hop. Supabase is still the data store and security layer.
+- **Reliable, not fire-and-forget:** the outbox row is written *before* sending and the send is awaited before the response ends, so the serverless function is never frozen mid-delivery. A unique key on `(inquiry_id, device)` plus the existing per-submission token guarantee a retried request can't notify a device twice; the notification `tag` also makes the browser replace, not stack, a repeat.
+- **Outcomes per device:** success -> `sent`. HTTP 404/410 (device unsubscribed/expired) -> device deactivated, never retried. 429/5xx/network -> retried after 1 min, 5 min, 30 min, 2 h (5 attempts total). Other 4xx (bad payload or VAPID key mismatch) -> marked `dead`, not retried. Only a status code or a generic label is stored; never endpoints, keys or error bodies.
+- **Privacy:** the outbox and subscription tables hold no customer data. The notification text is generic so nothing sensitive shows on a lock screen.
+- **Realtime:** only a convenience for an already-open dashboard. It cannot wake a closed browser; only Web Push does that, and Web Push still depends on the browser vendor's push service (Google, Mozilla, Apple, Microsoft) being reachable by your device.
+
+#### Setup
+1. **Apply the SQL.** Supabase -> SQL Editor -> paste and run `supabase/migrations/20261030000000_admin_push_notifications.sql` (after `schema.sql` and the CRM migration). It is additive and safe to re-run: it creates `admin_push_subscriptions`, `admin_push_outbox`, two functions, RLS policies, and adds `crm_inquiries` to the Realtime publication. Nothing is dropped or modified.
+2. **Generate VAPID keys (once):** `npm run vapid:generate` (or `node scripts/generate-vapid-keys.mjs`). It prints a public/private pair and writes nothing to disk. Alternative: `npx web-push generate-vapid-keys`.
+3. **Environment variables** (local `.env.local` **and** Vercel -> Project -> Settings -> Environment Variables, Production + Preview):
+
+   | Variable | Value | Visible to browser? |
+   |---|---|---|
+   | `NEXT_PUBLIC_VAPID_PUBLIC_KEY` | public key from step 2 | yes (by design) |
+   | `VAPID_PRIVATE_KEY` | private key from step 2 | **no, secret** |
+   | `VAPID_SUBJECT` | `mailto:you@yourdomain.com` (optional; defaults to the site URL) | no |
+   | `CRON_SECRET` | long random string, e.g. `openssl rand -hex 32` | **no, secret** |
+   | `SUPABASE_SERVICE_ROLE_KEY` | already required by the CRM | **no, secret** |
+
+   Redeploy after adding them (`NEXT_PUBLIC_` values are baked in at build). Do not change the VAPID keys later without having every device turn notifications off and on again.
+4. **Install the dependency:** run `npm install` (adds `web-push` and `@types/web-push`) and commit the updated `package-lock.json`.
+5. **Retry job.** `vercel.json` schedules `/api/push/retry` once a day (the most frequent schedule the free Hobby plan allows; Pro can run it every few minutes by editing the schedule). Vercel sends `CRON_SECRET` automatically. Manual run: `curl -H "Authorization: Bearer $CRON_SECRET" https://thepopsybar.com/api/push/retry` -> JSON counts of sent/retry/expired/dead. To inspect failures: `select status, attempts, last_status_code, last_error from admin_push_outbox where status in ('failed','dead') order by created_at desc;`
+
+#### Subscribe a device
+Sign in at `/admin/login`, open `/admin/dashboard`, click **Turn on notifications on this device**, and allow the browser prompt (the prompt only ever appears after that click). The dashboard then shows "Notifications are on for this device" with **Send test** and **Turn off**. Do this on each phone/computer you want alerts on; each device is a separate subscription.
+- **Android (Chrome, Edge, Samsung Internet, Firefox):** works in the browser; installing to the Home Screen is optional.
+- **iPhone/iPad (iOS/iPadOS 16.4 or newer):** Safari tab pages cannot use push. Tap Share -> **Add to Home Screen**, open the CRM **from the new Home Screen icon**, then turn notifications on. Push is not available on older iOS.
+- **Desktop:** Chrome, Edge and Firefox work; Safari on macOS 13+ works. The browser (or its background process) must be allowed to run; some browsers/OS focus modes suppress notifications.
+- Not supported: private/incognito windows and browsers without Push API support (the control says so). If permission was blocked, re-allow it in the browser/site settings and reload.
+
+#### Test with the browser closed
+1. Subscribe a phone (above), click **Send test**: you should see "Test notification — The Popsy Bar".
+2. Close the browser/app completely (on iOS swipe the Home Screen app away).
+3. From another device submit a real inquiry on `https://thepopsybar.com`. Within seconds the phone should show **New Event Inquiry — The Popsy Bar**; tapping it opens `/admin/dashboard`.
+4. Nothing arrived? Check, in order: Vercel function logs for `push-skipped` / `push-failed` lines (they say whether VAPID or the service-role key is missing); `select * from admin_push_subscriptions` (your device should have `is_active = true`); the outbox query above; that notifications aren't muted at the OS level.
+
+#### Manual checks that need your own Supabase / device (not done by the developer)
+- RLS: while signed out (anon key) `select * from admin_push_subscriptions` and `admin_push_outbox` must return nothing; a second admin must not see the first admin's devices.
+- A real notification on a physical Android and iOS device, and a real 404/410 expiry.
 
 ### Local testing
 
 ```bash
 npm install
-cp .env.example .env.local   # fill in Supabase + SUPABASE_SERVICE_ROLE_KEY (+ OneSignal if you want pushes)
+cp .env.example .env.local   # fill in Supabase + SUPABASE_SERVICE_ROLE_KEY + VAPID keys (npm run vapid:generate)
 npm run dev
-npm run test:crm             # CRM logic, mapping, handler flows, OneSignal request shape (no network)
+npm run test:crm             # CRM logic, mapping and inquiry handler flows (no network)
+npm run test:push            # Web Push: validation, outbox delivery/retry/expiry, admin authorization, service worker
 npm run test:inquiry         # original FormSubmit tests
 npm run lint && npm run build
 ```
 
 ### Vercel
 
-Add the new variables (Production + Preview as needed): `SUPABASE_SERVICE_ROLE_KEY`, `NEXT_PUBLIC_ONESIGNAL_APP_ID`, `ONESIGNAL_REST_API_KEY`, and optionally `ONESIGNAL_SEGMENT`, `NEXT_PUBLIC_SITE_URL`, `NEXT_PUBLIC_BUSINESS_TIME_ZONE`. Existing Supabase/Cloudinary/FormSubmit variables stay as they are. Redeploy afterwards (`NEXT_PUBLIC_` values are baked in at build time).
+Add the new variables (Production + Preview as needed): `SUPABASE_SERVICE_ROLE_KEY`, `NEXT_PUBLIC_VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `CRON_SECRET`, and optionally `VAPID_SUBJECT`, `NEXT_PUBLIC_SITE_URL`, `NEXT_PUBLIC_BUSINESS_TIME_ZONE`. Existing Supabase/Cloudinary/FormSubmit variables stay as they are. Redeploy afterwards (`NEXT_PUBLIC_` values are baked in at build time).

@@ -11,5 +11,5 @@ export default async function CrmPage() {
   const ctx = await getAdminContext();
   if (ctx.state === "signed-out") redirect("/admin/login?next=/admin/dashboard");
   if (ctx.state !== "ok") return null;
-  return <CrmDashboard adminId={ctx.user.id} />;
+  return <CrmDashboard />;
 }

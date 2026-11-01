@@ -1,7 +1,7 @@
 import { todayISO } from "@/lib/crm/dates";
 import { mapWebsiteFields, type WebsiteRecord } from "@/lib/crm/map-website";
-import { sendInquiryPush, type PushOutcome } from "@/lib/crm/onesignal";
 import { saveWebsiteInquiry, type SaveOutcome } from "@/lib/crm/save-website";
+import { sendInquiryPush, type PushOutcome } from "@/lib/push/inquiry-push";
 import { clientIp, isRateLimited } from "./rate-limit";
 import { MAX_BODY_BYTES, parseInquiry } from "./validate";
 import { sendToFormSubmit, type SendOptions, type SendOutcome } from "./send";
@@ -27,8 +27,8 @@ type HandlerConfig = {
   log?: (entry: Record<string, unknown>) => void;
   /** Writes the inquiry to the CRM (Supabase). Replaceable in tests. */
   saveToCrm?: (record: WebsiteRecord, token: string | null) => Promise<SaveOutcome>;
-  /** Sends the OneSignal push for a freshly saved inquiry. Replaceable in tests. */
-  notify?: (record: WebsiteRecord, recordId: string) => Promise<PushOutcome>;
+  /** Queues + delivers the Web Push for a freshly inserted inquiry. Replaceable in tests. */
+  notify?: (recordId: string) => Promise<PushOutcome>;
   today?: () => string;
   /** Returns true when this client should be told to slow down. Replaceable in tests. */
   rateLimited?: (ip: string) => boolean;
@@ -95,22 +95,27 @@ export function createInquiryHandler({
     if (crm.kind === "failed") log({ kind: "crm-save-failed", code: crm.code });
     if (crm.kind === "unconfigured") log({ kind: "crm-not-configured" });
 
-    // 3) One push per newly saved inquiry. A failure never affects the saved record or the email.
-    if (crm.kind === "saved") {
-      try {
-        const push = await notify(mapped.record, crm.id);
-        if (push.kind === "failed") log({ kind: "push-failed", reason: push.reason });
-        if (push.kind === "skipped") log({ kind: "push-skipped", reason: push.reason });
-      } catch {
-        log({ kind: "push-failed", reason: "exception" });
-      }
-    }
+    // 3) One push per newly INSERTED inquiry (never for duplicates, failures or rejected submissions).
+    //    It starts now and runs alongside the email, and is always awaited before the response is sent,
+    //    so the serverless function is not frozen mid-delivery. A failure never affects the saved
+    //    record or the email; failed deliveries stay in the outbox for the retry job.
+    const pushPromise: Promise<void> =
+      crm.kind === "saved"
+        ? notify(crm.id).then(
+            (push) => {
+              if (push.kind === "failed" || push.kind === "partial") log({ kind: "push-failed", reason: push.reason });
+              if (push.kind === "skipped") log({ kind: "push-skipped", reason: push.reason });
+            },
+            () => log({ kind: "push-failed", reason: "exception" }),
+          )
+        : Promise.resolve();
 
     // 4) The existing FormSubmit email, unchanged. A duplicate token means the record already exists,
     //    so only the email is attempted again and no second record or push is created.
     const payload = { ...parsed.fields, _subject: parsed.subject, _template: "table", _captcha: "false" };
     const origin = new URL(request.url).origin;
     const outcome = await send(endpoint, payload, origin, sendOptions);
+    await pushPromise;
 
     // When the CRM holds the inquiry, an email problem must not make the customer resubmit.
     if (stored && outcome.kind !== "accepted" && outcome.kind !== "unreachable") {

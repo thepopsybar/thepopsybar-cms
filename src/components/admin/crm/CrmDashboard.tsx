@@ -10,10 +10,11 @@ import RecordDetail from "./RecordDetail";
 import RecordForm from "./RecordForm";
 import SourceBadge from "./SourceBadge";
 import { ToastViewport, useToasts } from "./Toasts";
+import { useWebsiteInquiryRealtime } from "./useInquiryRealtime";
 
 type SourceFilter = "all" | "website" | "manual";
 
-export default function CrmDashboard({ adminId }: { adminId: string }) {
+export default function CrmDashboard() {
   const [rows, setRows] = useState<CrmRecord[]>([]);
   const [total, setTotal] = useState(0);
   const [counts, setCounts] = useState<CrmCounts>({ total: 0, website: 0, manual: 0 });
@@ -73,6 +74,14 @@ export default function CrmDashboard({ adminId }: { adminId: string }) {
 
   const refresh = useCallback(() => setReloadKey((k) => k + 1), []);
 
+  // Open-dashboard alert for a brand-new website inquiry (manual entries never arrive here).
+  useWebsiteInquiryRealtime(
+    useCallback(() => {
+      push("success", "New website inquiry received.");
+      refresh();
+    }, [push, refresh]),
+  );
+
   function toggleSort(column: CrmSort) {
     if (sort === column) setDir((d) => (d === "desc" ? "asc" : "desc"));
     else {
@@ -123,7 +132,7 @@ export default function CrmDashboard({ adminId }: { adminId: string }) {
         <div>
           <h1>Customer CRM</h1>
           <p className="admin-hint">Manage your event inquiries and bookings.</p>
-          <PushSetup adminId={adminId} />
+          <PushSetup />
         </div>
         <div className="crm-head__actions">
           <button type="button" className="btn btn--blush" onClick={() => setAdding(true)}>Add Manually</button>

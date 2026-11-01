@@ -1,13 +1,12 @@
 /**
  * Run with:  npm run test:crm   (uses `npx tsx --test`; adds no dependencies)
- * Nothing real is contacted: Supabase, OneSignal and FormSubmit are all replaced by fakes.
+ * Nothing real is contacted: Supabase, Web Push and FormSubmit are all replaced by fakes.
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { describe, it } from "node:test";
 import { formatEventDate, isPastDate, isValidISODate, todayISO } from "../src/lib/crm/dates";
 import { mapWebsiteFields, type WebsiteRecord } from "../src/lib/crm/map-website";
-import { buildPushText, sendInquiryPush } from "../src/lib/crm/onesignal";
 import { OCCASION_TITLES, validateCrmInput } from "../src/lib/crm/validate";
 import { createInquiryHandler } from "../src/lib/inquiry/handler";
 import { isRateLimited } from "../src/lib/inquiry/rate-limit";
@@ -128,49 +127,6 @@ describe("mapWebsiteFields", () => {
   });
 });
 
-describe("push text and OneSignal request", () => {
-  it("builds the documented message", () => {
-    const year = new Date().getUTCFullYear();
-    const m = buildPushText({ full_name: "Sarah Johnson", occasion_type: "Wedding", event_date: `${year}-12-15` });
-    assert.equal(m.title, "New Website Inquiry — The Popsy Bar");
-    assert.equal(m.message, "Sarah Johnson submitted an inquiry for a Wedding on December 15.");
-  });
-  it("falls back gracefully when fields are missing", () => {
-    assert.match(buildPushText({ full_name: "(No name provided)", occasion_type: null, event_date: null }).message, /new inquiry/i);
-    assert.equal(buildPushText({ full_name: "Al", occasion_type: null, event_date: null }).message, "Al submitted an inquiry.");
-    assert.match(buildPushText({ full_name: "Al", occasion_type: "Event", event_date: null }).message, /for an Event/);
-  });
-  it("skips when OneSignal is not configured and never calls fetch", async () => {
-    delete process.env.ONESIGNAL_REST_API_KEY;
-    delete process.env.NEXT_PUBLIC_ONESIGNAL_APP_ID;
-    let called = false;
-    const out = await sendInquiryPush(rec(), "id-1", (async () => { called = true; return new Response("{}"); }) as typeof fetch);
-    assert.equal(out.kind, "skipped");
-    assert.equal(called, false);
-  });
-  it("sends one correctly shaped, authenticated request and reports failures safely", async () => {
-    process.env.ONESIGNAL_REST_API_KEY = "secret-key";
-    process.env.NEXT_PUBLIC_ONESIGNAL_APP_ID = "app-123";
-    const seen: { url: string; init: RequestInit }[] = [];
-    const ok = await sendInquiryPush(rec(), "rec-1", (async (url: string, init: RequestInit) => { seen.push({ url, init }); return new Response('{"id":"n1"}'); }) as unknown as typeof fetch);
-    assert.equal(ok.kind, "sent");
-    assert.equal(seen.length, 1);
-    assert.equal(seen[0].url, "https://api.onesignal.com/notifications");
-    assert.equal((seen[0].init.headers as Record<string, string>).Authorization, "Key secret-key");
-    const body = JSON.parse(seen[0].init.body as string);
-    assert.equal(body.app_id, "app-123");
-    assert.equal(body.target_channel, "push");
-    assert.equal(body.url, "https://thepopsybar.com/admin/dashboard");
-    assert.equal(body.idempotency_key, "rec-1");
-    const fail = await sendInquiryPush(rec(), "rec-2", (async () => new Response("{}", { status: 401 })) as typeof fetch);
-    assert.deepEqual(fail, { kind: "failed", reason: "HTTP 401" });
-    const noRecipients = await sendInquiryPush(rec(), "rec-3", (async () => new Response('{"errors":["All included players are not subscribed"]}')) as typeof fetch);
-    assert.equal(noRecipients.kind, "failed");
-    delete process.env.ONESIGNAL_REST_API_KEY;
-    delete process.env.NEXT_PUBLIC_ONESIGNAL_APP_ID;
-  });
-});
-
 describe("rate limiter", () => {
   it("blocks the 7th request in the window and recovers after it", () => {
     const t = 1_000_000;
@@ -179,10 +135,6 @@ describe("rate limiter", () => {
     assert.equal(isRateLimited("1.1.1.1", t + 11 * 60 * 1000), false);
   });
 });
-
-function rec(): WebsiteRecord {
-  return { full_name: "Sarah Johnson", email: "s@x.co", event_date: null, occasion_type: "Wedding", guest_count: null, event_description: "", phone: null, event_location: null, extra: {} };
-}
 
 describe("POST /api/inquiries with CRM + push + email", () => {
   const accepted: SendOutcome = { kind: "accepted" };
@@ -286,13 +238,13 @@ describe("POST /api/inquiries with CRM + push + email", () => {
 
 describe("static safety checks", () => {
   const read = (p: string) => fs.readFileSync(new URL(`../${p}`, import.meta.url), "utf8");
-  it("manual-entry actions never import OneSignal", () => {
-    assert.ok(!/onesignal/i.test(read("src/app/admin/(panel)/dashboard/actions.ts")));
+  it("manual-entry actions never import the push code", () => {
+    assert.ok(!/push/i.test(read("src/app/admin/(panel)/dashboard/actions.ts")));
   });
   it("client code never imports the service-role client or reads secrets", () => {
     for (const f of ["CrmDashboard", "RecordForm", "RecordDetail", "PushSetup", "Modal", "Toasts"]) {
       const src = read(`src/components/admin/crm/${f}.tsx`);
-      assert.ok(!/supabase\/service|SERVICE_ROLE|ONESIGNAL_REST/.test(src), f);
+      assert.ok(!/supabase\/service|SERVICE_ROLE|VAPID_PRIVATE/.test(src), f);
     }
   });
   it("every admin action checks for an admin", () => {

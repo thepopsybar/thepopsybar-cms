@@ -2635,6 +2635,9 @@ html.preloader-active body { overflow: hidden; }
 .crm-push { margin-top: 0.35rem; font-size: 0.8rem; }
 .crm-push__ok { color: #1f6b3a; }
 .crm-push__warn { color: #a1233f; }
+.crm-push__note { color: var(--color-muted); }
+.crm-push { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.9rem; }
+.crm-push__actions { display: inline-flex; gap: 0.9rem; }
 .crm-linkbtn { padding: 0; border: 0; background: none; color: var(--color-accent-deep); font: inherit; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
 .crm-linkbtn:disabled { opacity: 0.55; cursor: default; }
 .crm-linkbtn--danger { margin-right: auto; color: #a1233f; }
