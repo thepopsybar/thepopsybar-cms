@@ -3,7 +3,7 @@
 import type { FormEvent } from "react";
 import FormFeedback from "./FormFeedback";
 import { formToFields } from "@/lib/forms/submit";
-import { useFormSubmit } from "@/lib/forms/use-submit";
+import { useInquirySubmit } from "@/lib/forms/use-submit";
 import { useMinEventDate } from "@/lib/forms/use-min-date";
 
 type ContactFormProps = {
@@ -15,7 +15,7 @@ type ContactFormProps = {
 
 export default function ContactForm({ occasions, initialEvent, submitLabel, finePrint }: ContactFormProps) {
   const minDate = useMinEventDate();
-  const { status, submit } = useFormSubmit("New contact inquiry — The Popsy Bar");
+  const { status, submit } = useInquirySubmit("New contact inquiry — The Popsy Bar");
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();

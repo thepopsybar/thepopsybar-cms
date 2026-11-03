@@ -41,7 +41,7 @@ export default async function AdminDashboard() {
         <div className="admin-card">
           <h2>Inquiry emails</h2>
           <p className="admin-muted">
-            All forms are sent through FormSubmit to thepopsybar1@gmail.com.
+            Every website inquiry is saved to the Customer CRM, then an email notification is sent from notifications@thepopsybar.com.
           </p>
         </div>
       </div>

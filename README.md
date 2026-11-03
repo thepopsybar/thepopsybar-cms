@@ -1,6 +1,6 @@
 # The Popsy Bar
 
-Next.js 16 (App Router) · TypeScript · Tailwind 4 · Supabase (content + auth + CRM) · Cloudinary (images) · FormSubmit (inquiry email) · Web Push (VAPID, no third-party service)
+Next.js 16 (App Router) · TypeScript · Tailwind 4 · Supabase (content + auth + CRM) · Cloudinary (images) · Brevo (inquiry email) · Web Push (VAPID, no third-party service)
 
 ## 1. Install and run
 
@@ -51,36 +51,36 @@ Until the SQL is run the site keeps working from its built-in content, and `/adm
 
 Free plan note: Cloudinary's free plan uses a shared monthly credit allowance, so storage, bandwidth and transformations all count toward it. Check your plan's current limits in the dashboard.
 
-## 5. Inquiry emails (FormSubmit)
+## 5. Inquiry emails (Brevo)
 
 Every public form (Contact, and the homepage / Plan Your Event inquiry; the Design-your-cart choice is attached to that inquiry) goes through one path:
 
-`browser form -> POST /api/inquiries (same origin) -> FormSubmit AJAX -> recipient inbox`
+`browser form -> POST /api/inquiries (same origin) -> validate -> save to Supabase -> Brevo transactional email -> notification inbox`
 
-- Recipient and endpoint: `src/lib/site-config.ts` (`FORM_SUBMIT_EMAIL`, `FORM_SUBMIT_ENDPOINT`).
-- Server code: `src/lib/inquiry/*` (validation, one upstream request, error classification) and `src/app/api/inquiries/route.ts`.
-- The site says "sent" **only** when FormSubmit's JSON reply confirms acceptance. Activation-needed, rejections, non-JSON replies, timeouts and network errors are reported as separate failures with different messages and are logged **without** names, emails or message text.
-- A request is **never retried automatically** once it may have been delivered (this would send duplicate emails). The one exception: if the server provably never got the request out (DNS/connect/TLS failure or connect timeout), the browser may try FormSubmit directly **once**. Turn that off with `INQUIRY_BROWSER_FALLBACK=off`.
+- Server code: `src/lib/inquiry/handler.ts` (the flow), `src/lib/email/brevo.ts` (the Brevo API client, `https://api.brevo.com/v3/smtp/email`, `api-key` header), `src/lib/email/inquiry-email.ts` (the HTML + plain-text email) and `src/app/api/inquiries/route.ts`.
+- The email is sent **only after the inquiry was inserted** into `crm_inquiries`, from `notifications@thepopsybar.com`, with the visitor's address as **Reply-To**. The subject is always `New Website Inquiry – The Popsy Bar`. Only fields the visitor actually filled in appear in it.
+- The recipient comes **only** from the server variable `INQUIRY_NOTIFICATION_EMAIL`. Nothing the browser sends can change the recipient, sender, cc/bcc or subject. All visitor text is HTML-escaped and stripped of line breaks where it could reach a header.
+- The Brevo API key lives only in the server environment (`BREVO_API_KEY`, never `NEXT_PUBLIC_`). It is used in one server-side request header and never sent to the browser, logged or returned.
+- **The database and the email are independent.** If the save fails, the visitor gets an error and no email is sent. If the save succeeds but Brevo fails (bad key, blocked IP, rate limit, outage, timeout, missing settings), the inquiry is kept, the visitor sees "received and saved", and the failure is logged on the server (`email-rejected` / `email-timeout` / `email-network-error` / `email-not-configured`, with Brevo's status and error code, never the inquiry text).
+- **No duplicates.** Each form attempt carries a token; a repeated request finds the stored inquiry and sends no second row, push or email. The Brevo request is made once and is never retried automatically.
 
-**One-time activation (required):** the first submission to a new address makes FormSubmit email an activation link to that inbox; mail is not delivered until it is clicked (check spam). Then submit a second test and confirm it arrives.
+### Environment variables (server-only)
 
-**Optional:** after activation FormSubmit can give you a random alias. Set `FORMSUBMIT_ENDPOINT=https://formsubmit.co/ajax/<alias>` (server env) to stop the real address being used anywhere.
+| Variable | Value |
+| --- | --- |
+| `BREVO_API_KEY` | API key from Brevo -> SMTP & API -> API Keys (secret) |
+| `BREVO_SENDER_EMAIL` | `notifications@thepopsybar.com` (verified sender; this is also the default) |
+| `BREVO_SENDER_NAME` | `The Popsy Bar` (also the default) |
+| `INQUIRY_NOTIFICATION_EMAIL` | the inbox that receives notifications |
 
-### If submissions time out
+If Brevo returns `401` with an "unrecognised IP address" message, turn off IP blocking in Brevo -> Security -> Authorised IPs (Vercel does not use fixed IP addresses).
 
-```bash
-npm run check:formsubmit          # DNS / TCP / TLS / HTTPS timings from this machine's Node.js
-npm run check:formsubmit -- --send  # also submits one labelled test inquiry
-npm run test:inquiry              # unit tests (mocked upstream + local test servers; sends no email)
-```
+### Deploying (GitHub + Vercel)
 
-The output shows which phase fails. On Windows, a firewall/VPN/proxy that treats `node.exe` differently from PowerShell is a common cause; Node does not use browser/Windows proxy settings automatically.
-
-### Deploying the fix (GitHub + Vercel)
-
-1. Commit and push the changes to GitHub; Vercel redeploys automatically.
-2. No new variables are required. Optional: `FORMSUBMIT_ENDPOINT`, `INQUIRY_BROWSER_FALLBACK` (Vercel -> Project -> Settings -> Environment Variables, then redeploy).
-3. On the live site, send one test from the Contact page, click the FormSubmit activation link if you receive it, then send a second test and confirm delivery.
+1. Vercel -> Project -> Settings -> Environment Variables: add the four variables above (Production, and Preview if you test there). Mark `BREVO_API_KEY` as **Sensitive**.
+2. Commit and push; Vercel redeploys. **Variables added to an existing deployment only take effect after a redeploy.**
+3. On the live site send one test from the Contact page. Check the notification inbox (and spam the first time), then check the inquiry in `/admin/dashboard`.
+4. If no email arrives, Vercel -> Logs -> filter `[inquiries]` and look for an `email-*` line. Brevo -> Transactional -> Logs shows what Brevo received.
 
 ## 6. Using the admin
 
@@ -123,15 +123,15 @@ public form -> POST /api/inquiries (server)
    1. validate (+ no past event date)
    2. save to Supabase crm_inquiries   (source forced to "website" on the server)
    3. Web Push to admin devices (once per device, only if step 2 inserted a NEW row; runs alongside the email)
-   4. FormSubmit email (unchanged)
+   4. Brevo email notification (only when step 2 inserted a NEW row; its failure never affects the saved record)
 admin "Add Manually" -> server action -> insert with source "manual" (no push; toast only)
 ```
 
 - Reads/edits/deletes run as the signed-in admin through Row Level Security (`public.is_admin()`), and every server action re-checks admin status. `/admin/*` is also gated by the proxy and the admin layout.
 - Public visitors have **no** database policy on `crm_inquiries`. Website rows are written by the server with the service-role key after validation.
 - `source`, `created_at` and `id` are protected by a database trigger, so editing can never change them. `created_at` is always generated by the database; `event_date` is the customer's event date.
-- Each form attempt carries a random token; if a request is repeated, the server finds the existing record, does **not** insert or push again, and only retries the email.
-- If the email step fails after the record is saved, the customer sees a "received and saved" message (not a "delivery guaranteed" claim) and the record is kept. If the database save fails, the email still goes out (as before) and the error is logged server-side; the customer is never told it was saved.
+- Each form attempt carries a random token; if a request is repeated, the server finds the existing record and does **not** insert, push or email again.
+- If the email step fails after the record is saved, the customer sees a "received and saved" message (not a "delivery guaranteed" claim) and the record is kept. If the database save fails, the customer gets an error, nothing is emailed, and the error is logged server-side; the customer is never told it was saved.
 - Event dates may not be in the past (browser `min` + server check on the manual form, the homepage form, the plan form and the contact form). "Today" uses `America/Chicago`; change with `NEXT_PUBLIC_BUSINESS_TIME_ZONE`.
 - Occasion choices come from `src/lib/occasions.ts` (single source of truth).
 - Public form abuse protection: honeypot, minimum fill time, strict validation, size limits, and a best-effort per-IP rate limit (6 per 10 minutes; per server instance on serverless hosts).
@@ -207,10 +207,10 @@ cp .env.example .env.local   # fill in Supabase + SUPABASE_SERVICE_ROLE_KEY + VA
 npm run dev
 npm run test:crm             # CRM logic, mapping and inquiry handler flows (no network)
 npm run test:push            # Web Push: validation, outbox delivery/retry/expiry, admin authorization, service worker
-npm run test:inquiry         # original FormSubmit tests
+npm run test:inquiry         # validation, Brevo client + email template, handler failure handling (no network)
 npm run lint && npm run build
 ```
 
 ### Vercel
 
-Add the new variables (Production + Preview as needed): `SUPABASE_SERVICE_ROLE_KEY`, `NEXT_PUBLIC_VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `CRON_SECRET`, and optionally `VAPID_SUBJECT`, `NEXT_PUBLIC_SITE_URL`, `NEXT_PUBLIC_BUSINESS_TIME_ZONE`. Existing Supabase/Cloudinary/FormSubmit variables stay as they are. Redeploy afterwards (`NEXT_PUBLIC_` values are baked in at build time).
+Add the new variables (Production + Preview as needed): `SUPABASE_SERVICE_ROLE_KEY`, `NEXT_PUBLIC_VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `CRON_SECRET`, and optionally `VAPID_SUBJECT`, `NEXT_PUBLIC_SITE_URL`, `NEXT_PUBLIC_BUSINESS_TIME_ZONE`. Existing Supabase/Cloudinary variables stay as they are. The Brevo variables are listed in section 5. Redeploy afterwards (`NEXT_PUBLIC_` values are baked in at build time).

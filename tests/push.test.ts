@@ -289,7 +289,6 @@ describe("integration with /api/inquiries", () => {
     const counts = { email: 0, sends: 0, logs: [] as Record<string, unknown>[] };
     let call = 0;
     const handler = createInquiryHandler({
-      endpoint: "https://upstream.example/x",
       today: () => "2026-10-30",
       rateLimited: () => false,
       log: (e) => counts.logs.push(e),
@@ -298,7 +297,7 @@ describe("integration with /api/inquiries", () => {
         return k === "saved" ? { kind: "saved", id: INQ, record } : k === "duplicate" ? { kind: "duplicate" } : { kind: "failed", code: "X" };
       },
       notify: (id) => sendInquiryPush(id, { store: mem.store, sender: async (d, p) => { counts.sends++; return sender(d, p); } }),
-      send: async () => { counts.email++; return { kind: "accepted" }; },
+      sendEmail: async () => { counts.email++; return { kind: "sent", messageId: "<m@test>" }; },
     });
     const post = async () => (await handler(new Request("https://thepopsybar.com/api/inquiries", { method: "POST", body: JSON.stringify(form) }))).json() as Promise<Record<string, unknown>>;
     return { post, counts };
@@ -315,13 +314,13 @@ describe("integration with /api/inquiries", () => {
     await post();
     await post();
     assert.equal(counts.sends, 2);
-    assert.equal(counts.email, 2); // the email retry is the existing behaviour for a repeated request
+    assert.equal(counts.email, 1); // a repeated request must not send a second notification email
   });
   it("no push when the inquiry was not saved", async () => {
     const { post, counts } = build(async () => {}, ["failed"]);
     await post();
     assert.equal(counts.sends, 0);
-    assert.equal(counts.email, 1);
+    assert.equal(counts.email, 0); // the notification email only follows a successful database insert
   });
   it("a push-service outage never loses the inquiry or blocks / repeats the email", async () => {
     const { post, counts } = build(async () => { throw pushError(503); }, ["saved"]);

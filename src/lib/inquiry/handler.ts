@@ -1,29 +1,28 @@
 import { todayISO } from "@/lib/crm/dates";
 import { mapWebsiteFields, type WebsiteRecord } from "@/lib/crm/map-website";
 import { saveWebsiteInquiry, type SaveOutcome } from "@/lib/crm/save-website";
+import { getBrevoConfig, sendBrevoEmail, type EmailOutcome } from "@/lib/email/brevo";
+import { buildInquiryEmail } from "@/lib/email/inquiry-email";
 import { sendInquiryPush, type PushOutcome } from "@/lib/push/inquiry-push";
 import { clientIp, isRateLimited } from "./rate-limit";
 import { MAX_BODY_BYTES, parseInquiry } from "./validate";
-import { sendToFormSubmit, type SendOptions, type SendOutcome } from "./send";
 
 export type InquiryResponse = {
   ok: boolean;
   message: string;
   code?: string;
-  /** True only when the request provably never left the server, so one client-side retry is safe. */
-  retrySafe?: boolean;
-  /** Direct browser endpoint, supplied only together with retrySafe. */
-  fallbackEndpoint?: string;
-  /** True when the inquiry is safely stored in the CRM even though the email step did not confirm. */
+  /** True when the inquiry is safely stored in the CRM. */
   saved?: boolean;
+  /** False when it is stored but the owner notification email was not confirmed. */
+  emailSent?: boolean;
 };
 
+/** What the notification step needs. Replaceable in tests. */
+export type NotifyEmailInput = { record: WebsiteRecord; formLabel: string };
+
 type HandlerConfig = {
-  endpoint: string;
-  /** Allow the browser to try FormSubmit directly once when the server could not reach it. */
-  allowBrowserFallback?: boolean;
-  send?: (endpoint: string, payload: Record<string, string>, origin: string, options?: SendOptions) => Promise<SendOutcome>;
-  sendOptions?: SendOptions;
+  /** Sends the owner notification email through Brevo. Replaceable in tests. */
+  sendEmail?: (input: NotifyEmailInput) => Promise<EmailOutcome>;
   log?: (entry: Record<string, unknown>) => void;
   /** Writes the inquiry to the CRM (Supabase). Replaceable in tests. */
   saveToCrm?: (record: WebsiteRecord, token: string | null) => Promise<SaveOutcome>;
@@ -35,27 +34,52 @@ type HandlerConfig = {
 };
 
 const TOKEN_PATTERN = /^[A-Za-z0-9-]{8,64}$/;
+const THANKS = "Thank you! Your inquiry has been sent. We’ll be in touch soon.";
 const SAVED_NOTE =
   "Thank you! Your inquiry has been received and saved. We couldn’t confirm our email notification, but our team will see it. If it’s urgent, please contact us directly.";
-
-const CONTACT_DIRECTLY = "contact us directly";
+const NOT_SAVED =
+  "We couldn’t save your inquiry right now. Please try again shortly or contact us directly.";
 
 function json(body: InquiryResponse, status: number): Response {
   return Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
 }
 
+/** Reads the Brevo settings from the server environment and sends one notification. Never throws. */
+export async function sendInquiryEmail({ record, formLabel }: NotifyEmailInput): Promise<EmailOutcome> {
+  const config = getBrevoConfig();
+  if (!config.ok) return { kind: "not_configured", missing: config.missing };
+  const email = buildInquiryEmail({ record, formLabel });
+  return sendBrevoEmail(
+    { subject: email.subject, htmlContent: email.htmlContent, textContent: email.textContent, replyTo: email.replyTo, tags: ["website-inquiry"] },
+    config.config,
+  );
+}
+
+/** Log entry for a failed notification. Contains the outcome and Brevo's error code, never inquiry contents or secrets. */
+function emailFailureLog(outcome: Exclude<EmailOutcome, { kind: "sent" }>): Record<string, unknown> {
+  switch (outcome.kind) {
+    case "not_configured":
+      return { kind: "email-not-configured", missing: outcome.missing };
+    case "rejected":
+      return { kind: "email-rejected", status: outcome.status, code: outcome.code, detail: outcome.detail };
+    case "unconfirmed":
+      return { kind: "email-unconfirmed", status: outcome.status };
+    case "timeout":
+      return { kind: "email-timeout" };
+    default:
+      return { kind: "email-network-error", code: outcome.code };
+  }
+}
+
 /** Builds the POST handler for /api/inquiries. Kept out of route.ts so it can be tested and reused. */
 export function createInquiryHandler({
-  endpoint,
-  allowBrowserFallback = true,
-  send = sendToFormSubmit,
-  sendOptions,
+  sendEmail = sendInquiryEmail,
   log = (entry) => console.error("[inquiries]", entry),
   saveToCrm = saveWebsiteInquiry,
   notify = sendInquiryPush,
   today = () => todayISO(),
   rateLimited = (ip) => isRateLimited(ip),
-}: HandlerConfig) {
+}: HandlerConfig = {}) {
   return async function POST(request: Request): Promise<Response> {
     const ip = clientIp(request);
     if (ip && rateLimited(ip)) {
@@ -80,8 +104,8 @@ export function createInquiryHandler({
 
     const parsed = parseInquiry(body);
     if (!parsed.ok) return json({ ok: false, code: parsed.code, message: parsed.message }, 400);
-    // Bots only: a hidden field was filled in. Acknowledge without forwarding.
-    if (parsed.honeypot) return json({ ok: true, message: "Thank you! Your inquiry has been sent." }, 200);
+    // Bots only: a hidden field was filled in. Acknowledge without storing or emailing.
+    if (parsed.honeypot) return json({ ok: true, message: THANKS }, 200);
 
     // 1) Validate the event details (including "no dates in the past") before anything is stored or emailed.
     const mapped = mapWebsiteFields(parsed.fields, today());
@@ -91,94 +115,49 @@ export function createInquiryHandler({
     const rawToken = typeof (body as Record<string, unknown>)._token === "string" ? ((body as Record<string, unknown>)._token as string) : "";
     const token = TOKEN_PATTERN.test(rawToken) ? rawToken : null;
     const crm = await saveToCrm(mapped.record, token);
-    const stored = crm.kind === "saved" || crm.kind === "duplicate";
-    if (crm.kind === "failed") log({ kind: "crm-save-failed", code: crm.code });
-    if (crm.kind === "unconfigured") log({ kind: "crm-not-configured" });
 
-    // 3) One push per newly INSERTED inquiry (never for duplicates, failures or rejected submissions).
-    //    It starts now and runs alongside the email, and is always awaited before the response is sent,
-    //    so the serverless function is not frozen mid-delivery. A failure never affects the saved
-    //    record or the email; failed deliveries stay in the outbox for the retry job.
-    const pushPromise: Promise<void> =
-      crm.kind === "saved"
-        ? notify(crm.id).then(
-            (push) => {
-              if (push.kind === "failed" || push.kind === "partial") log({ kind: "push-failed", reason: push.reason });
-              if (push.kind === "skipped") log({ kind: "push-skipped", reason: push.reason });
-            },
-            () => log({ kind: "push-failed", reason: "exception" }),
-          )
-        : Promise.resolve();
+    if (crm.kind === "unconfigured") {
+      log({ kind: "crm-not-configured" });
+      return json({ ok: false, code: "SAVE_UNAVAILABLE", message: NOT_SAVED }, 503);
+    }
+    if (crm.kind === "failed") {
+      log({ kind: "crm-save-failed", code: crm.code });
+      return json({ ok: false, code: "SAVE_FAILED", message: NOT_SAVED }, 503);
+    }
 
-    // 4) The existing FormSubmit email, unchanged. A duplicate token means the record already exists,
-    //    so only the email is attempted again and no second record or push is created.
-    const payload = { ...parsed.fields, _subject: parsed.subject, _template: "table", _captcha: "false" };
-    const origin = new URL(request.url).origin;
-    const outcome = await send(endpoint, payload, origin, sendOptions);
+    // The same submission token arrived again: the inquiry is already stored and its notification
+    // was handled by the first request. Nothing new is inserted, pushed or emailed, so a repeated
+    // request (double click, flaky connection, retry) can never produce a second email.
+    if (crm.kind === "duplicate") {
+      return json({ ok: true, saved: true, message: THANKS }, 200);
+    }
+
+    // 3) From here on the inquiry is safely stored, and nothing below can undo that.
+    //    Web Push (admin devices) starts now and runs alongside the email. It is always awaited so the
+    //    serverless function is not frozen mid-delivery. A failure never affects the saved record or the email.
+    const pushPromise: Promise<void> = notify(crm.id).then(
+      (push) => {
+        if (push.kind === "failed" || push.kind === "partial") log({ kind: "push-failed", reason: push.reason });
+        if (push.kind === "skipped") log({ kind: "push-skipped", reason: push.reason });
+      },
+      () => log({ kind: "push-failed", reason: "exception" }),
+    );
+
+    // 4) The Brevo notification, exactly once, only because a NEW row was just inserted.
+    let outcome: EmailOutcome;
+    try {
+      outcome = await sendEmail({ record: mapped.record, formLabel: parsed.subject });
+    } catch {
+      outcome = { kind: "network", code: "UNEXPECTED" };
+    }
     await pushPromise;
 
-    // When the CRM holds the inquiry, an email problem must not make the customer resubmit.
-    if (stored && outcome.kind !== "accepted" && outcome.kind !== "unreachable") {
-      log({ kind: "email-unconfirmed-but-saved", email: outcome.kind });
-      return json({ ok: true, saved: true, message: SAVED_NOTE }, 200);
+    if (outcome.kind === "sent") {
+      return json({ ok: true, saved: true, emailSent: true, message: THANKS }, 200);
     }
 
-    switch (outcome.kind) {
-      case "accepted":
-        return json({ ok: true, message: "Thank you! Your inquiry has been sent. We’ll be in touch soon." }, 200);
-
-      case "activation":
-        log({ kind: outcome.kind });
-        return json(
-          { ok: false, code: "ACTIVATION_REQUIRED", message: `Our inquiry form isn’t fully set up yet, so your message was not delivered. Please ${CONTACT_DIRECTLY}.` },
-          503,
-        );
-
-      case "rejected":
-        log({ kind: outcome.kind, status: outcome.status, detail: outcome.detail });
-        return json(
-          { ok: false, code: "UPSTREAM_REJECTED", message: `The email service didn’t accept your inquiry. Please try again shortly or ${CONTACT_DIRECTLY}.` },
-          502,
-        );
-
-      case "malformed":
-        log({ kind: outcome.kind, status: outcome.status });
-        return json(
-          { ok: false, code: "UPSTREAM_INVALID_RESPONSE", message: `The email service gave an unexpected reply. Please try again shortly or ${CONTACT_DIRECTLY}.` },
-          502,
-        );
-
-      case "unreachable":
-        log({ kind: outcome.kind, code: outcome.code });
-        return json(
-          {
-            ok: false,
-            code: "UPSTREAM_UNREACHABLE",
-            message: `We couldn’t reach the email service. Please try again shortly or ${CONTACT_DIRECTLY}.`,
-            retrySafe: true,
-            ...(stored ? { saved: true } : {}),
-            ...(allowBrowserFallback ? { fallbackEndpoint: endpoint } : {}),
-          },
-          503,
-        );
-
-      case "timeout":
-        log({ kind: outcome.kind });
-        return json(
-          {
-            ok: false,
-            code: "UPSTREAM_TIMEOUT",
-            message: `The email service is taking too long to answer, so we can’t confirm your message was delivered. Please don’t resubmit; ${CONTACT_DIRECTLY} to be sure.`,
-          },
-          504,
-        );
-
-      default:
-        log({ kind: outcome.kind, code: outcome.code });
-        return json(
-          { ok: false, code: "UPSTREAM_NETWORK_ERROR", message: `The connection to the email service was interrupted, so we can’t confirm delivery. Please don’t resubmit; ${CONTACT_DIRECTLY} to be sure.` },
-          502,
-        );
-    }
+    // Email trouble must never make the visitor think the inquiry was lost, or ask them to resubmit.
+    log({ ...emailFailureLog(outcome), inquiryId: crm.id });
+    return json({ ok: true, saved: true, emailSent: false, message: SAVED_NOTE }, 200);
   };
 }

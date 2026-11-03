@@ -7,7 +7,6 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "check:formsubmit": "node scripts/check-formsubmit.mjs",
     "test:inquiry": "npx --yes tsx --test tests/inquiry.test.ts",
     "test:crm": "npx --yes tsx --test tests/crm.test.ts",
     "test:push": "npx --yes tsx --test tests/push.test.ts",

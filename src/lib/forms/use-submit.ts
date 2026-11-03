@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { submitToFormSubmit } from "./submit";
+import { submitInquiry } from "./submit";
 
 export type FormStatus = { state: "idle" | "pending" | "success" | "error"; message: string };
 
@@ -16,7 +16,7 @@ function newToken(): string {
 }
 
 /** Pending/success/error state plus basic bot protection (honeypot + minimum fill time). */
-export function useFormSubmit(subject: string) {
+export function useInquirySubmit(subject: string) {
   const [status, setStatus] = useState<FormStatus>({ state: "idle", message: "" });
   const mountedAt = useRef<number | null>(null);
   // One token per submission attempt: if a request is repeated, the server can tell it is the same
@@ -36,7 +36,7 @@ export function useFormSubmit(subject: string) {
       }
       setStatus({ state: "pending", message: "Sending your inquiry…" });
       if (!token.current) token.current = newToken();
-      const result = await submitToFormSubmit(fields, subject, token.current);
+      const result = await submitInquiry(fields, subject, token.current);
       if (result.ok) token.current = null;
       setStatus({ state: result.ok ? "success" : "error", message: result.message });
       return result.ok;

@@ -1,6 +1,9 @@
 import { isPastDate, isValidISODate, todayISO } from "./dates";
 import { MAX_GUESTS, OCCASION_TITLES } from "./validate";
 
+/** Stored when a submission has no name (the column is NOT NULL). Not a real name: never display it as one. */
+export const NO_NAME_PLACEHOLDER = "(No name provided)";
+
 /** What gets stored for a public form submission (the `source` is added by trusted server code). */
 export type WebsiteRecord = {
   full_name: string;
@@ -99,7 +102,7 @@ export function mapWebsiteFields(fields: Record<string, string>, today: string =
     ok: true,
     record: {
       // The forms require a name; this fallback only protects the NOT NULL column and invents nothing.
-      full_name: full_name || "(No name provided)",
+      full_name: full_name || NO_NAME_PLACEHOLDER,
       email,
       event_date,
       occasion_type,

@@ -1,18 +1,13 @@
 import { createInquiryHandler } from "@/lib/inquiry/handler";
-import { FORM_SUBMIT_ENDPOINT } from "@/lib/site-config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-// Allows the upstream call (max ~18s) plus overhead on Vercel.
+// Allows the database save, the Brevo request (10s limit) and the push delivery, plus overhead on Vercel.
 export const maxDuration = 30;
 
 /**
- * Optional server-side override. FormSubmit can issue a random alias for your address
- * (https://formsubmit.co/ajax/<alias>) so the address itself never appears anywhere public.
+ * Every website form posts here. Order of work: validate -> save to Supabase -> notify.
+ * The owner notification goes out through Brevo from the server, to the address in the
+ * INQUIRY_NOTIFICATION_EMAIL environment variable (never from anything the browser sent).
  */
-const endpoint = process.env.FORMSUBMIT_ENDPOINT?.trim() || FORM_SUBMIT_ENDPOINT;
-
-export const POST = createInquiryHandler({
-  endpoint,
-  allowBrowserFallback: process.env.INQUIRY_BROWSER_FALLBACK !== "off",
-});
+export const POST = createInquiryHandler();

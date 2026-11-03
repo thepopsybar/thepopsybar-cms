@@ -3,7 +3,7 @@
 import { useMemo, useState, useSyncExternalStore, type FormEvent } from "react";
 import FormFeedback from "./FormFeedback";
 import { formToFields } from "@/lib/forms/submit";
-import { useFormSubmit } from "@/lib/forms/use-submit";
+import { useInquirySubmit } from "@/lib/forms/use-submit";
 import { useMinEventDate } from "@/lib/forms/use-min-date";
 import {
   clearCartDesign,
@@ -23,7 +23,7 @@ type EventInquiryFormProps = {
 
 export default function EventInquiryForm({ variant, occasions, initialOccasion, submitLabel }: EventInquiryFormProps) {
   const [occasion, setOccasion] = useState(initialOccasion || occasions[0] || "");
-  const { status, submit } = useFormSubmit(
+  const { status, submit } = useInquirySubmit(
     variant === "plan" ? "New event proposal request — The Popsy Bar" : "New event inquiry (homepage) — The Popsy Bar",
   );
   const rawDesign = useSyncExternalStore(subscribeCartDesign, getCartDesignSnapshot, getCartDesignServerSnapshot);
